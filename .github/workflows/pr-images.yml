@@ -2,8 +2,9 @@
 # 这里只放行资源目录里新增的图片和视频。要在新位置放应用资源时，在同一个 PR 里扩充白名单。
 name: PR Images
 
+# fork 说明: 本 fork 只跟随上游发布做 Android 构建, 不接收上游 PR, 改为仅手动触发。
 on:
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read

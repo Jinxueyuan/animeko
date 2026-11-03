@@ -3,26 +3,9 @@
 # Generated with https://github.com/typesafegithub/github-workflows-kt
 
 name: 'Build'
+# fork 说明: 上游这条流水线要 Apple 签名证书 / AWS / Firebase 等一整套密钥, 在本 fork 中必然失败。
+# 这里改成仅手动触发, 自动构建由 fork-android-release.yml 负责。
 on:
-  push:
-    branches:
-    - 'main'
-    - 'release/**'
-    paths-ignore:
-    - '**/*.md'
-    - '.idea/**'
-    - '.junie/**'
-    - '.readme/**'
-    - '.run/**'
-    - 'scripts/*'
-  pull_request:
-    paths-ignore:
-    - '**/*.md'
-    - '.idea/**'
-    - '.junie/**'
-    - '.readme/**'
-    - '.run/**'
-    - 'scripts/*'
   workflow_dispatch: {}
 concurrency:
   group: '${{ github.workflow }}-${{ github.event_name }}-${{ github.ref_name == ''main'' && github.run_id || github.ref_name }}'

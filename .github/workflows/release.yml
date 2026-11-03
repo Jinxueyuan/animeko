@@ -3,10 +3,9 @@
 # Generated with https://github.com/typesafegithub/github-workflows-kt
 
 name: 'Release'
+# fork 说明: 上游发布流水线同样依赖 Apple/AWS 等密钥, 在本 fork 中无法运行, 改为仅手动触发。
 on:
-  push:
-    tags:
-    - 'v*'
+  workflow_dispatch: {}
 permissions:
   actions: 'write'
   contents: 'write'

@@ -10,12 +10,9 @@
 # 改了更新器源码后从这里下载 artifact 换掉它.
 name: Build ani_update
 
+# fork 说明: 这是 Windows 桌面端的更新器, 本 fork 只做 Android 手机端, 改为仅手动触发。
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - 'tools/ani-update/**'
-      - '.github/workflows/build-ani-update.yml'
 
 jobs:
   build:

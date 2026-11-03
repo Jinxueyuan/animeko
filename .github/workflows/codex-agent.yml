@@ -62,17 +62,10 @@
 
 name: Codex Agent
 
+# fork 说明: 这条流水线跑在 open-ani 自建 runner 上并依赖 openanibot 令牌, 在本 fork 中无法运行,
+# 会永久排队。改为仅手动触发。
 on:
-  issues:
-    types: [opened, labeled]
-  pull_request_review:
-    types: [submitted]
-  # Review requests come in on pull_request_target so the base branch's workflow runs with the bot
-  # token for fork PRs too; the qa job only ever reads the PR head.
-  pull_request_target:
-    types: [review_requested]
-  issue_comment:
-    types: [created]
+  workflow_dispatch: {}
 
 permissions: {}
 

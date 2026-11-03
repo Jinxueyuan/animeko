@@ -10,17 +10,10 @@
 # 只构建 Windows: Linux 上 mpv 的渲染上下文必须加入播放窗口的 GLX 环境, 没有桌面时无法实播.
 name: Build datasource-test-mcp
 
+# fork 说明: 这里构建的是 Windows 桌面端的调试工具, 本 fork 只做 Android 手机端,
+# 改成仅手动触发, 避免每次 push 都跑一次无关构建。
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - '**/*.md'
-  pull_request:
-    paths:
-      - 'tools/datasource-test-mcp/**'
-      - '.github/workflows/datasource-test-mcp.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
