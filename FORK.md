@@ -83,10 +83,18 @@ bash scripts/fork/disable-upstream-workflows.sh
 > 于是每次推 tag 都会拉起上游 `Release`（Windows/macOS 全跳过、`Create Release` 失败），并发出失败邮件。
 > 现在 tag 指向本仓库提交，读取的是本仓库「仅手动」的版本，这个问题不会再出现。
 
-### 4. 签名密钥（建议配置）
+### 4. 签名密钥（已配置）
+
+> **当前状态**：本仓库已配置稳定签名密钥（alias `animeko`，4096 位 RSA，有效期至 2056 年），
+> 证书 SHA-256 指纹 `09:44:C3:FC:F2:25:D0:E3:54:65:AB:6A:FE:12:B4:70:04:B8:94:6C:ED:AF:09:AA:C4:65:58:40:EE:69:AB:40`。
+> 从 `v6.4.0` 起重发布的包已用该密钥签名，后续版本可直接覆盖升级。
+> 密钥库与密码**不在仓库里**，请使用 `keystore/README.txt` 记录的位置自行离线备份；
+> 密钥丢失后已安装用户只能卸载重装，所以务必备份。
+>
+> 验证任意 APK 的签名：`apksigner verify --print-certs <apk>`，输出的 SHA-256 digest 应与上面一致。
 
 不配置也能出包，但每次构建会生成一次性密钥，包与包之间签名不同，升级时必须先卸载。
-要获得可覆盖升级的稳定签名，先生成一个自己的 keystore：
+要重新生成一套自己的 keystore：
 
 ```bash
 keytool -genkeypair -keystore ani-release.jks -storetype PKCS12 \
