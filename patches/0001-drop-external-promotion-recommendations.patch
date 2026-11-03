@@ -1,0 +1,14 @@
+diff --git a/app/shared/app-data/src/commonMain/kotlin/domain/episode/GetSubjectRecommendationFlowUseCase.kt b/app/shared/app-data/src/commonMain/kotlin/domain/episode/GetSubjectRecommendationFlowUseCase.kt
+index e2ed67ca1..03d4fc0cd 100644
+--- a/app/shared/app-data/src/commonMain/kotlin/domain/episode/GetSubjectRecommendationFlowUseCase.kt
++++ b/app/shared/app-data/src/commonMain/kotlin/domain/episode/GetSubjectRecommendationFlowUseCase.kt
+@@ -44,7 +44,8 @@ fun interface GetSubjectRecommendationUseCase : UseCase {
+ 
+ class GetSubjectRecommendationUseCaseImpl(private val service: SubjectService) : GetSubjectRecommendationUseCase {
+     override suspend fun invoke(subjectId: Int): List<SubjectRecommendation> {
+-        return service.getSubjectRecommendations(subjectId, 15).map {
++        // 只保留可跳转站内条目的推荐; 服务端下发的 `uri` 条目是外部推广位.
++        return service.getSubjectRecommendations(subjectId, 15).filter { it.uri == null }.map {
+             SubjectRecommendation(
+                 subjectId = it.subjectId,
+                 name = it.subjectName,

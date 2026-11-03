@@ -1,1 +1,7 @@
 *.html linguist-vendored
+
+# 本 fork 新增的文件必须固定为 LF: 补丁要在 Linux 的 CI 上 git apply, 脚本要在 bash 里执行,
+# 一旦被 Windows 的 core.autocrlf 转成 CRLF 就会在 CI 上失败。
+patches/** text eol=lf
+scripts/fork/** text eol=lf
+.github/workflows/fork-android-release.yml text eol=lf
