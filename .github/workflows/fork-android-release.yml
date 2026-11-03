@@ -1,0 +1,395 @@
+# 跟随上游发布: 拉取上游最新 release → 应用 patches/ → 构建 Android APK → 在本仓库发布。
+#
+# 为什么这样设计:
+# - 上游没有跨仓库的 release webhook, 所以用定时轮询上游的 releases 接口发现新版本。
+# - 补丁不合并进 main, 而是在构建时应用在「上游 tag 的代码树」上, 这样上游怎么改代码都不会有合并冲突;
+#   只有补丁本身失效时才会失败, 失败信息会指出是哪个补丁。
+# - 构建不依赖任何推送权限: 构建在一个 job 里从上游 tag 完成, 产物总是作为 artifact 上传。
+#   发布 release (需要 contents: write) 是独立的一步, 没权限时只跳过发布, 不影响出包。
+# - 发布用内置 GITHUB_TOKEN (permissions: contents: write), 不需要任何 PAT/secret。
+#   代价是 tag 只能打在本仓库自己的提交上: GitHub 不允许 App 令牌把 tag 指向「带有
+#   .github/workflows/ 改动的上游 commit」(需要 workflows=write, 而 App 令牌永远没有)。
+#   构建实际用的上游 commit 会写进 release notes, 便于追溯。
+
+name: Fork Android Release
+
+on:
+  schedule:
+    # 每 6 小时检查一次上游是否发布了新版本 (UTC)
+    - cron: '41 */6 * * *'
+  push:
+    # 改了补丁或流水线本身时立刻跑一次, 当作冒烟测试:
+    # 上游 tag 的 release 已经存在时会自动跳过, 不会重复构建。
+    branches:
+      - 'main'
+    paths:
+      - '.github/workflows/fork-android-release.yml'
+      - 'patches/**'
+      - 'scripts/fork/**'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '指定上游 tag (留空 = 取上游最新的正式 release)'
+        required: false
+        type: string
+      force:
+        description: '该 tag 已发布过也重新构建并覆盖 release'
+        required: false
+        type: boolean
+        default: false
+      abis:
+        description: 'Android ABI, 逗号分隔; all 表示 arm64-v8a, armeabi-v7a, x86_64'
+        required: false
+        type: string
+        default: all
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-android-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: open-ani/animeko
+
+jobs:
+  resolve:
+    name: 'Resolve upstream release'
+    runs-on: 'ubuntu-latest'
+    outputs:
+      tag: '${{ steps.resolve.outputs.tag }}'
+      version: '${{ steps.resolve.outputs.version }}'
+      build: '${{ steps.resolve.outputs.build }}'
+      upstream_sha: '${{ steps.resolve.outputs.upstream_sha }}'
+      can_publish: '${{ steps.preflight.outputs.can_publish }}'
+    steps:
+      - id: 'preflight'
+        name: 'Check Actions write permission'
+        # 这一步只做探测, 不失败: 没有写权限时照样构建, 只是不发布 release。
+        env:
+          GH_TOKEN: '${{ github.token }}'
+        run: |
+          set -euo pipefail
+          # 不要用 repos/{repo} 的 .permissions.push 判断: 那是 GitHub App 的安装权限,
+          # 不反映 workflow 里 permissions: contents: write 的实际授权, 会一直返回 false。
+          # 直接做一次真实写入探测: 在默认分支 tip 上建一个临时 tag, 成功则说明能推 tag / 建 release。
+          # 必须指向默认分支已有的提交 —— 指向上游 commit 会因缺少 workflows 权限被拒,
+          # 那并不代表内置令牌没有写权限。
+          base_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          probe="refs/tags/write-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=${probe}" -f "sha=${base_sha}" >/dev/null 2>&1; then
+            can_push=true
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/${probe}" >/dev/null 2>&1 || true
+            echo "写权限探测: 成功"
+          else
+            can_push=false
+            echo "写权限探测: 被拒绝"
+          fi
+          echo "push 权限: ${can_push}"
+          if [ "$can_push" = "true" ]; then
+            echo "can_publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "can_publish=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::令牌没有写权限, 本次只构建并上传 APK, 不会创建 release/tag。"
+            echo "::warning::到仓库 Settings -> Actions -> General -> Workflow permissions 选 'Read and write permissions' 即可。"
+          fi
+
+      - id: 'resolve'
+        name: 'Pick tag'
+        env:
+          GH_TOKEN: '${{ github.token }}'
+          INPUT_TAG: '${{ inputs.tag }}'
+          INPUT_FORCE: '${{ inputs.force }}'
+          TARGET_REPO: '${{ github.repository }}'
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-}"
+          if [ -z "$tag" ]; then
+            # 上游是另一个仓库, fork 的 GITHUB_TOKEN 读不到它的 API (跨仓库会 404),
+            # 所以这里用匿名请求读公开数据。
+            tag="$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=30" \
+              | jq -r '[.[] | select(.draft == false and .prerelease == false)][0].tag_name')"
+          fi
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "::error::无法确定上游 release tag"
+            exit 1
+          fi
+          version="${tag#v}"
+          echo "上游 tag: ${tag} (版本 ${version})"
+
+          build=true
+          if gh release view "$tag" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            if [ "${INPUT_FORCE:-false}" = "true" ]; then
+              echo "本仓库已有 ${tag} 的 release, 按要求重建"
+            else
+              echo "本仓库已有 ${tag} 的 release, 跳过"
+              build=false
+            fi
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+
+          # 记录构建真正用的上游 commit, 写进 release notes 供追溯
+          # (/commits/{ref} 接受 tag 名, 注解 tag 会自动解引用到 commit)。
+          upstream_sha="$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/commits/${tag}" | jq -r '.sha // ""')"
+          echo "上游 commit: ${upstream_sha}"
+          echo "upstream_sha=${upstream_sha}" >> "$GITHUB_OUTPUT"
+
+  build-android:
+    name: 'Build Android APK'
+    needs: ['resolve']
+    if: "needs.resolve.outputs.build == 'true'"
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 300
+    env:
+      CI_TAG: '${{ needs.resolve.outputs.tag }}'
+      ABIS: '${{ inputs.abis || ''all'' }}'
+      VERSION: '${{ needs.resolve.outputs.version }}'
+    steps:
+      - uses: 'actions/checkout@v4'
+        with:
+          # 需要完整历史才能取到上游 tag 和 main 上的补丁
+          fetch-depth: 0
+
+      - name: 'Check out upstream tag and apply patches'
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "+refs/tags/${CI_TAG}:refs/tags/${CI_TAG}"
+          git checkout --detach "refs/tags/${CI_TAG}"
+          # 子模块版本来自 tag 自己的 .gitmodules, 必须在 checkout 之后初始化
+          git submodule update --init --recursive
+
+          # 补丁和脚本在本仓库 main 上, 上游 tag 里没有, 从 main 取过来
+          git checkout origin/main -- patches scripts/fork
+          chmod +x scripts/fork/*.sh
+          bash scripts/fork/apply-patches.sh
+
+      # 项目把 JDK toolchain 固定为 vendor=jetbrains (gradle.properties 的 jvm.toolchain.vendor),
+      # 用 Temurin 之类会找不到匹配的 toolchain, 所以这里装 JetBrains Runtime。
+      - name: 'Set up JetBrains Runtime 21'
+        run: |
+          set -euo pipefail
+          jbr_dir="${RUNNER_TEMP}/jbr"
+          url='https://cache-redirector.jetbrains.com/intellij-jbr/jbrsdk-21.0.11-linux-x64-b1163.116.tar.gz'
+          curl -fsSL "$url" -o "${RUNNER_TEMP}/jbr.tar.gz"
+          mkdir -p "$jbr_dir"
+          tar -xzf "${RUNNER_TEMP}/jbr.tar.gz" -C "$jbr_dir" --strip-components=1
+          echo "JAVA_HOME=${jbr_dir}" >> "$GITHUB_ENV"
+          echo "${jbr_dir}/bin" >> "$GITHUB_PATH"
+          "${jbr_dir}/bin/java" -version
+
+      - name: 'Free disk space'
+        # ubuntu-latest 默认只剩十几 GB, Android 三 ABI × 两个 flavor 的 release 构建很容易写满。
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/share/swift /opt/hostedtoolcache/CodeQL \
+            /usr/local/lib/android/sdk/ndk /usr/local/lib/android/sdk/system-images \
+            /usr/local/lib/android/sdk/emulator || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          echo "释放后:"
+          df -h / | tail -1
+
+      - name: 'Set up Android SDK'
+        uses: 'android-actions/setup-android@v3'
+        with:
+          packages: 'platform-tools platforms;android-37.0 build-tools;36.0.0'
+          accept-android-sdk-licenses: 'true'
+
+      - name: 'Set up Gradle'
+        uses: 'gradle/actions/setup-gradle@v3'
+
+      - id: 'keystore'
+        name: 'Prepare signing key and local.properties'
+        env:
+          KEYSTORE_BASE64: '${{ secrets.ANDROID_KEYSTORE_BASE64 }}'
+          KEYSTORE_PASSWORD: '${{ secrets.ANDROID_KEYSTORE_PASSWORD }}'
+          KEY_ALIAS: '${{ secrets.ANDROID_KEY_ALIAS }}'
+          KEY_PASSWORD: '${{ secrets.ANDROID_KEY_PASSWORD }}'
+          DANDANPLAY_APP_ID: '${{ secrets.DANDANPLAY_APP_ID }}'
+          DANDANPLAY_APP_SECRET: '${{ secrets.DANDANPLAY_APP_SECRET }}'
+        run: |
+          set -euo pipefail
+          store_password="${KEYSTORE_PASSWORD:-android}"
+          key_alias="${KEY_ALIAS:-ani}"
+          key_password="${KEY_PASSWORD:-${store_password}}"
+
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > keystore.jks
+            echo "使用仓库 secret 提供的签名密钥"
+          else
+            # 没有配置 secret 时生成一次性密钥, 保证 APK 可以安装 (不同次构建的签名会不同)
+            keytool -genkeypair -keystore keystore.jks -storetype PKCS12 \
+              -alias "$key_alias" -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$store_password" -keypass "$key_password" \
+              -dname "CN=Ani Fork, O=Ani Fork, C=CN" >/dev/null 2>&1
+            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64, 本次使用临时密钥签名, 与历史版本签名不一致, 升级需要先卸载"
+          fi
+
+          rm -f local.properties
+          {
+            echo "jvm.toolchain.version=21"
+            echo "ani.android.abis=${ABIS}"
+            echo "kotlin.native.ignoreDisabledTargets=true"
+            if [ -n "${DANDANPLAY_APP_ID:-}" ]; then
+              echo "ani.dandanplay.app.id=${DANDANPLAY_APP_ID}"
+              echo "ani.dandanplay.app.secret=${DANDANPLAY_APP_SECRET:-}"
+            fi
+            echo "signing_release_storeFileFromRoot=keystore.jks"
+            echo "signing_release_storePassword=${store_password}"
+            echo "signing_release_keyAlias=${key_alias}"
+            echo "signing_release_keyPassword=${key_password}"
+          } > local.properties
+          sed 's/^\(signing_release_storePassword\|signing_release_keyPassword\)=.*/\1=***/' local.properties
+
+      - name: 'Update release version name'
+        run: './gradlew updateReleaseVersionNameFromGit --no-configuration-cache --console=plain'
+
+      # 两个 flavor 分开构建: 单个任务的峰值内存和磁盘占用减半, 失败时也能一眼看出是哪个 flavor。
+      - name: 'Build phone APK'
+        shell: 'bash'
+        run: |
+          set +e
+          ./gradlew :app:android:assembleDefaultRelease \
+            "-Dorg.gradle.jvmargs=-Xmx6g -Dkotlin.daemon.jvm.options=-Xmx4g" \
+            --stacktrace --console=plain 2>&1 | tee build-phone.log
+          rc=${PIPESTATUS[0]}
+          echo "== 构建手机端退出码: ${rc}"
+          df -h / | tail -1
+          free -g | head -2
+          if [ "$rc" -ne 0 ]; then
+            # 注释可以通过 check-runs API 读到, 作为拿不到完整日志时的兜底
+            msg="$(tail -c 5000 build-phone.log | awk '{printf "%s%%0A", $0}')"
+            echo "::error::手机端构建失败, 日志尾部: ${msg}"
+            exit "$rc"
+          fi
+
+      - name: 'Build TV APK'
+        shell: 'bash'
+        run: |
+          set +e
+          ./gradlew :app:android:assembleTvRelease \
+            "-Dorg.gradle.jvmargs=-Xmx6g -Dkotlin.daemon.jvm.options=-Xmx4g" \
+            --stacktrace --console=plain 2>&1 | tee build-tv.log
+          rc=${PIPESTATUS[0]}
+          echo "== 构建 TV 端退出码: ${rc}"
+          df -h / | tail -1
+          if [ "$rc" -ne 0 ]; then
+            msg="$(tail -c 5000 build-tv.log | awk '{printf "%s%%0A", $0}')"
+            echo "::error::TV 端构建失败, 日志尾部: ${msg}"
+            exit "$rc"
+          fi
+
+      - name: 'Collect APKs'
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          phone="app/android/build/outputs/apk/default/release/android-default-universal-release.apk"
+          tv="app/android/build/outputs/apk/tv/release/android-tv-universal-release.apk"
+          for f in "$phone" "$tv"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::找不到构建产物 $f"
+              find app/android/build/outputs -name '*.apk' || true
+              exit 1
+            fi
+          done
+          cp "$phone" "out/ani-${VERSION}-universal.apk"
+          cp "$tv" "out/ani-tv-${VERSION}-universal.apk"
+          ls -lh out
+
+      - name: 'Upload APKs'
+        uses: 'actions/upload-artifact@v4'
+        with:
+          name: 'android-apks'
+          path: 'out/*.apk'
+          if-no-files-found: 'error'
+
+      - name: 'Job summary'
+        if: always()
+        run: |
+          {
+            echo "### Fork Android ${VERSION}"
+            echo
+            echo "- 上游 tag: \`${CI_TAG}\`"
+            echo "- ABI: \`${ABIS}\`"
+            echo "- 自动发布 release: \`${{ needs.resolve.outputs.can_publish }}\`"
+            echo
+            echo '```'
+            df -h / | tail -2
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: 'Publish release'
+    needs: ['resolve', 'build-android']
+    if: "needs.build-android.result == 'success' && needs.resolve.outputs.can_publish == 'true'"
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: 'actions/checkout@v4'
+        with:
+          fetch-depth: 0
+          # 只用内置令牌。带 workflow 权限的 PAT 能对整个账号写, 为了一个 tag 不值得。
+          token: '${{ github.token }}'
+          persist-credentials: true
+
+      - uses: 'actions/download-artifact@v4'
+        with:
+          name: 'android-apks'
+          path: 'dist'
+
+      - name: 'Push tag and create release'
+        env:
+          GH_TOKEN: '${{ github.token }}'
+          TAG: '${{ needs.resolve.outputs.tag }}'
+          VERSION: '${{ needs.resolve.outputs.version }}'
+          UPSTREAM_SHA: '${{ needs.resolve.outputs.upstream_sha }}'
+          TARGET_REPO: '${{ github.repository }}'
+        run: |
+          set -euo pipefail
+
+          # tag 打在本仓库的提交上, 不打在上游 commit 上。
+          # 实测: GitHub 拒绝 App 令牌把 tag 指向「带有 .github/workflows/ 改动的上游 commit」,
+          # 响应 403 + x-accepted-github-permissions: contents=write,workflows=write ——
+          # App 令牌永远拿不到 workflows=write。而指向本仓库已有提交则完全放行。
+          # 所以: tag 定位本仓库的构建提交, 上游 commit 记在 release notes 里。
+          git tag -f "$TAG" HEAD
+          if ! git push origin "refs/tags/${TAG}"; then
+            echo "tag ${TAG} 已存在且指向别处, 删除后重建"
+            git push origin ":refs/tags/${TAG}"
+            git push origin "refs/tags/${TAG}"
+          fi
+          echo "tag ${TAG} -> $(git rev-parse HEAD)"
+          git ls-remote --tags origin "refs/tags/${TAG}"
+
+          gh release view "$TAG" --repo "$TARGET_REPO" >/dev/null 2>&1 \
+            && gh release delete "$TAG" --repo "$TARGET_REPO" --yes --cleanup-tag=false || true
+
+          curl -fsSL -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TAG}" \
+            | jq -r '.body // ""' > upstream-notes.md || true
+
+          {
+            echo "基于上游 [\`${TAG}\`](https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG}) 的提交 [\`${UPSTREAM_SHA:0:9}\`](https://github.com/${UPSTREAM_REPO}/commit/${UPSTREAM_SHA}) 构建, 额外应用的补丁见 \`patches/\` (推荐位不再显示外部推广卡片)。"
+            echo
+            echo "> 本包由 fork 的 CI 自动构建, 未使用上游签名密钥, 与官方包签名不同, 覆盖安装前需先卸载官方版本。"
+            echo
+            echo "> 本仓库的同名 tag 指向构建流水线所在提交 (tag 无法指向上游 commit: GitHub 的 App 令牌没有 workflows 权限); APK 内容对应上面那个上游 commit + 补丁。"
+            echo
+            echo '---'
+            echo
+            if [ -f upstream-notes.md ]; then cat upstream-notes.md; fi
+          } > notes.md
+
+          ls -lh dist
+          gh release create "$TAG" dist/*.apk \
+            --repo "$TARGET_REPO" \
+            --title "$VERSION" \
+            --notes-file notes.md \
+            --verify-tag
