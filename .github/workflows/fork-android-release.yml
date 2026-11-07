@@ -291,17 +291,29 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          phone="app/android/build/outputs/apk/default/release/android-default-universal-release.apk"
-          tv="app/android/build/outputs/apk/tv/release/android-tv-universal-release.apk"
-          for f in "$phone" "$tv"; do
+          phone_dir="app/android/build/outputs/apk/default/release"
+          tv_dir="app/android/build/outputs/apk/tv/release"
+          phone_universal="$phone_dir/android-default-universal-release.apk"
+          tv_universal="$tv_dir/android-tv-universal-release.apk"
+          for f in "$phone_universal" "$tv_universal"; do
             if [ ! -f "$f" ]; then
               echo "::error::找不到构建产物 $f"
               find app/android/build/outputs -name '*.apk' || true
               exit 1
             fi
           done
-          cp "$phone" "out/ani-${VERSION}-universal.apk"
-          cp "$tv" "out/ani-tv-${VERSION}-universal.apk"
+          cp "$phone_universal" "out/ani-${VERSION}-universal.apk"
+          cp "$tv_universal" "out/ani-tv-${VERSION}-universal.apk"
+
+          # abis 输入可以只构建部分 ABI, 有 arm64-v8a 产物时才收录对应分包
+          phone_arm64="$phone_dir/android-default-arm64-v8a-release.apk"
+          tv_arm64="$tv_dir/android-tv-arm64-v8a-release.apk"
+          if [ -f "$phone_arm64" ] && [ -f "$tv_arm64" ]; then
+            cp "$phone_arm64" "out/ani-${VERSION}-arm64-v8a.apk"
+            cp "$tv_arm64" "out/ani-tv-${VERSION}-arm64-v8a.apk"
+          else
+            echo "::warning::没有 arm64-v8a 产物 (abis=${ABIS}), 本次只发布 universal 包"
+          fi
           ls -lh out
 
       - name: 'Upload APKs'

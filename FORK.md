@@ -146,8 +146,12 @@ base64 -w0 ani-release.jks
 
 产物命名沿用上游约定：
 
-- `ani-<版本>-universal.apk`（手机）
+- `ani-<版本>-universal.apk`（手机，包含全部 ABI）
+- `ani-<版本>-arm64-v8a.apk`（手机，仅 arm64-v8a）
 - `ani-tv-<版本>-universal.apk`（Android TV，包名 `me.him188.ani.tv`）
+- `ani-tv-<版本>-arm64-v8a.apk`（Android TV，仅 arm64-v8a）
+
+`abis` 输入只构建部分 ABI 时，release 中只收录实际产出的分包。
 
 ## 更新补丁
 
