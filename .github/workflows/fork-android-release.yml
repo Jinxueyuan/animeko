@@ -385,7 +385,18 @@ jobs:
 
           curl -fsSL -H 'Accept: application/vnd.github+json' \
             "https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TAG}" \
-            | jq -r '.body // ""' > upstream-notes.md || true
+            | jq -r '.body // ""' > upstream-body.md || true
+
+          # 上游 release body 在 ANI-SERVER-MAGIC-SEPARATOR 之后是下载表格、二维码和各架构
+          # 下载链接, 只保留分隔符之前的更新日志。分隔符缺失时不附加上游内容, 避免把上游
+          # 下载地址带进本仓库的 release。
+          if grep -qF '[//]: # (ANI-SERVER-MAGIC-SEPARATOR)' upstream-body.md; then
+            awk 'index($0, "[//]: # (ANI-SERVER-MAGIC-SEPARATOR)") { exit } { print }' \
+              upstream-body.md > upstream-notes.md
+          else
+            echo "::warning::上游 release 说明缺少 ANI-SERVER-MAGIC-SEPARATOR, 本次不附加上游更新日志"
+            : > upstream-notes.md
+          fi
 
           {
             echo "基于上游 [\`${TAG}\`](https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG}) 的提交 [\`${UPSTREAM_SHA:0:9}\`](https://github.com/${UPSTREAM_REPO}/commit/${UPSTREAM_SHA}) 构建, 额外应用的补丁见 \`patches/\` (推荐位不再显示外部推广卡片)。"
@@ -396,7 +407,7 @@ jobs:
             echo
             echo '---'
             echo
-            if [ -f upstream-notes.md ]; then cat upstream-notes.md; fi
+            cat upstream-notes.md
           } > notes.md
 
           ls -lh dist
